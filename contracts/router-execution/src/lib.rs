@@ -1787,6 +1787,53 @@ mod tests {
         }
     }
 
+    // ── Issue #1312: execute() InvalidAmount guard coverage ──────────────────
+    //
+    // execute() validates request.amount the same way estimate_fee validates its
+    // amount parameter (line 380: `if request.amount <= 0`). The existing
+    // execute() tests all use amount=1_000_000 and never exercise this guard.
+    // These tests assert the check fires for amount=0 and a negative amount.
+
+    #[test]
+    fn test_execute_invalid_amount_zero_returns_error() {
+        let (env, _, client) = setup();
+        let caller = Address::generate(&env);
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "transfer");
+
+        let request = ExecutionRequest {
+            target: target.clone(),
+            function: function.clone(),
+            simulate_first: false,
+            max_retries: 0,
+            args: Vec::new(&env),
+            amount: 0,
+        };
+
+        let result = client.try_execute(&caller, &request);
+        assert_eq!(result, Err(Ok(ExecutionError::InvalidAmount)));
+    }
+
+    #[test]
+    fn test_execute_invalid_amount_negative_returns_error() {
+        let (env, _, client) = setup();
+        let caller = Address::generate(&env);
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "transfer");
+
+        let request = ExecutionRequest {
+            target: target.clone(),
+            function: function.clone(),
+            simulate_first: false,
+            max_retries: 0,
+            args: Vec::new(&env),
+            amount: -1,
+        };
+
+        let result = client.try_execute(&caller, &request);
+        assert_eq!(result, Err(Ok(ExecutionError::InvalidAmount)));
+    }
+
     // ── Issue #811: execute() success path coverage ──────────────────────────
     //
     // Every other `execute()` test drives the failure/exhaustion branch by
