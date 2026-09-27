@@ -1127,6 +1127,39 @@ mod tests {
         assert_eq!(result, Err(Ok(ExecutionError::InvalidAmount)));
     }
 
+    // ── Issue #1311: MIN_RESOURCE_FEE_STROOPS floor coverage ────────────────
+    //
+    // Every existing estimate_fee test uses amount=1_000_000, which scales to
+    // 1000 (well above the MIN_RESOURCE_FEE_STROOPS=100 floor). These two tests
+    // use small amounts whose scaled values fall below the floor, exercising the
+    // `if scaled < MIN_RESOURCE_FEE_STROOPS` branch in compute_base_and_resource_fee.
+
+    #[test]
+    fn test_fee_estimate_small_amount_applies_min_resource_fee_floor() {
+        let (env, _, client) = setup();
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "transfer");
+        // amount=1 → scaled = 1 / 1000 = 0, which is below MIN_RESOURCE_FEE_STROOPS (100)
+        // → resource_fee must be floored at 100.
+        let estimate = client.estimate_fee(&target, &function, &1, &5000);
+        assert_eq!(estimate.resource_fee, 100); // MIN_RESOURCE_FEE_STROOPS
+        assert_eq!(estimate.base_fee, 100); // BASE_FEE_STROOPS
+        // No surge (load_bps=5000 < 8000), so total = (100 + 100) * 1 = 200.
+        assert_eq!(estimate.total_fee, 200);
+        assert!(!estimate.high_load);
+    }
+
+    #[test]
+    fn test_fee_estimate_amount_just_below_floor_threshold_applies_min_resource_fee() {
+        let (env, _, client) = setup();
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "transfer");
+        // amount=50_000 → scaled = 50_000 / 1000 = 50, which is below MIN_RESOURCE_FEE_STROOPS (100)
+        // → resource_fee must be floored at 100.
+        let estimate = client.estimate_fee(&target, &function, &50_000, &5000);
+        assert_eq!(estimate.resource_fee, 100); // MIN_RESOURCE_FEE_STROOPS
+    }
+
     #[test]
     fn test_stats_initial() {
         let (_, _, client) = setup();
