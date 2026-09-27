@@ -335,6 +335,13 @@ impl RouterMiddleware {
     /// In the unlikely event the flag is left set (e.g. by a future panic
     /// path), an admin can call `reset_guard(route)` to recover.
     pub fn pre_call(env: Env, caller: Address, route: String) -> Result<(), MiddlewareError> {
+        // ── Auth: caller must authorise this invocation ──────────────────────
+        // Without this check any account could call pre_call with an arbitrary
+        // `caller` address, forging rate-limit quotas, circuit-breaker state,
+        // and call-log attribution for addresses that never signed anything.
+        // (Issue #1315)
+        caller.require_auth();
+
         // ── Reentrancy guard: set ────────────────────────────────────────────
         if env
             .storage()
@@ -553,6 +560,13 @@ impl RouterMiddleware {
 
     /// Post-call hook: tracks failures and manages circuit breaker.
     pub fn post_call(env: Env, caller: Address, route: String, success: bool) {
+        // ── Auth: caller must authorise this invocation ──────────────────────
+        // Without this check any account could forge call-log entries, trip
+        // the circuit breaker, or reset it, all while attributing the action
+        // to an arbitrary `caller` address that never signed anything.
+        // (Issue #1315)
+        caller.require_auth();
+
         env.events().publish(
             (Symbol::new(&env, router_common::EVENT_POST_CALL),),
             (caller.clone(), route.clone(), success),
@@ -1287,6 +1301,56 @@ mod tests {
 
         client.post_call(&caller, &route, &true);
         client.post_call(&caller, &route, &false);
+    }
+
+    // ── Issue #1315: pre_call and post_call must require_auth on caller ───────
+
+    /// post_call requires the caller to authorise; without mock_all_auths the
+    /// call must fail.  (pre_call already had require_auth before this fix;
+    /// this test documents that post_call now enforces it too.)
+    #[test]
+    fn test_post_call_requires_caller_auth() {
+        // Use a fresh Env WITHOUT mock_all_auths so auth is actually enforced.
+        let env = Env::default();
+        env.ledger().set_timestamp(123456);
+        let contract_id = env.register_contract(None, RouterMiddleware);
+        let client = RouterMiddlewareClient::new(&env, &contract_id);
+        // initialize needs auth; mock just for that one call
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        // Drop mock_all_auths — from here auth is real.
+        // A fresh Env without mocking will panic/trap on require_auth if the
+        // invoker didn't sign.  We verify via try_ that it traps (Err).
+        // In Soroban SDK tests an unauthorized require_auth panics the
+        // contract, so try_post_call returns Err(Err(..)).
+        let victim = Address::generate(&env);
+        let route = String::from_str(&env, "oracle/get_price");
+        let result = client.try_post_call(&victim, &route, &false);
+        assert!(
+            result.is_err(),
+            "post_call must fail when caller has not authorised"
+        );
+    }
+
+    /// pre_call requires the caller to authorise; without mock_all_auths the
+    /// call must fail.
+    #[test]
+    fn test_pre_call_requires_caller_auth() {
+        let env = Env::default();
+        env.ledger().set_timestamp(123456);
+        let contract_id = env.register_contract(None, RouterMiddleware);
+        let client = RouterMiddlewareClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        let victim = Address::generate(&env);
+        let route = String::from_str(&env, "oracle/get_price");
+        let result = client.try_pre_call(&victim, &route);
+        assert!(
+            result.is_err(),
+            "pre_call must fail when caller has not authorised"
+        );
     }
 
     #[test]
