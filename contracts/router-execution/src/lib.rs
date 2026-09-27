@@ -2082,4 +2082,109 @@ mod tests {
         let result = client.try_simulate(&caller, &target, &function, &oversized_args);
         assert_eq!(result, Err(Ok(ExecutionError::ArgsTooLarge)));
     }
+
+    // ── Issue #1314: execute() simulate_first=true code path coverage ─────────
+    //
+    // All three existing execute()-driving tests set simulate_first=false.
+    // The entire simulation-before-execution branch — including the
+    // carried_first_result reuse mechanism and SimulationFailed early-return —
+    // has zero regression coverage.
+    //
+    // Test 1: simulate_first=true against a contract that succeeds — asserts
+    //   the target is invoked exactly once overall (via a call-counting static,
+    //   following FlakyTarget's pattern) and that result.simulated==true.
+    //
+    // Test 2: simulate_first=true against a non-existent contract — asserts
+    //   Err(ExecutionError::SimulationFailed) is returned and that TotalErrors
+    //   is incremented (via stats()).
+
+    // A static counter to track the total number of times SimulatedTarget
+    // is invoked (simulation + real invocation combined). Rolled back storage
+    // writes would not survive a failed call, so a process-global atomic is
+    // used to count across the simulated host boundary, following the same
+    // pattern as FLAKY_CALL_COUNT above.
+    static SIMULATED_CALL_COUNT: core::sync::atomic::AtomicU32 =
+        core::sync::atomic::AtomicU32::new(0);
+
+    #[contract]
+    pub struct SimulatedTarget;
+
+    #[contractimpl]
+    impl SimulatedTarget {
+        /// Increments SIMULATED_CALL_COUNT on every invocation and succeeds.
+        pub fn counted_ping(_env: Env) {
+            SIMULATED_CALL_COUNT.fetch_add(1, core::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[test]
+    fn test_execute_simulate_first_true_success_invokes_target_once() {
+        // Reset the counter so this test is independent of test ordering.
+        SIMULATED_CALL_COUNT.store(0, core::sync::atomic::Ordering::SeqCst);
+
+        let (env, _admin, client) = setup();
+        let mock_id = env.register_contract(None, SimulatedTarget);
+        let caller = Address::generate(&env);
+        let function = Symbol::new(&env, "counted_ping");
+
+        let request = ExecutionRequest {
+            target: mock_id.clone(),
+            function: function.clone(),
+            simulate_first: true,
+            max_retries: 0,
+            args: Vec::new(&env),
+            amount: 1_000_000,
+        };
+
+        let result = client.execute(&caller, &request);
+
+        // The result must indicate success and that simulation was run.
+        assert!(result.success);
+        assert!(result.simulated);
+        assert_eq!(result.attempts, 1);
+
+        // The carried_first_result mechanism means the simulation result is
+        // reused as attempt #1 — the target must have been invoked exactly once
+        // total (not twice). Because Soroban rolls back storage on failed calls
+        // but our counter lives in a process-global static (outside ledger state),
+        // this accurately reflects the true invocation count.
+        let invocation_count = SIMULATED_CALL_COUNT.load(core::sync::atomic::Ordering::SeqCst);
+        assert_eq!(
+            invocation_count, 1,
+            "target should be invoked exactly once when simulate_first=true succeeds"
+        );
+
+        // Stats: one success, no errors.
+        let (total_execs, total_errors) = client.stats();
+        assert_eq!(total_execs, 1);
+        assert_eq!(total_errors, 0);
+    }
+
+    #[test]
+    fn test_execute_simulate_first_true_failure_returns_simulation_failed() {
+        let (env, _admin, client) = setup();
+        let caller = Address::generate(&env);
+        // Use a random address with no registered contract — dry_run_invoke will
+        // return false and the SimulationFailed early-return fires.
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "transfer");
+
+        let request = ExecutionRequest {
+            target: target.clone(),
+            function: function.clone(),
+            simulate_first: true,
+            max_retries: 0,
+            args: Vec::new(&env),
+            amount: 1_000_000,
+        };
+
+        let result = client.try_execute(&caller, &request);
+        assert_eq!(result, Err(Ok(ExecutionError::SimulationFailed)));
+
+        // TotalErrors must have been incremented by log_error inside the
+        // SimulationFailed branch.
+        let (total_execs, total_errors) = client.stats();
+        assert_eq!(total_execs, 0);
+        assert_eq!(total_errors, 1);
+    }
 }
