@@ -892,12 +892,47 @@ impl RouterMiddleware {
     }
 
     /// Get the current circuit breaker state for a route.
+    ///
+    /// Like `rate_limit_state`, this function recomputes elapsed-state before
+    /// returning so the view reflects reality even if no `pre_call` has run
+    /// since the recovery window ended.  Specifically, when the circuit is open
+    /// and the recovery window has already elapsed, this function returns a
+    /// state with `is_open: false` / `is_half_open: true` — the same transition
+    /// that `check_and_transition` would make on the next real `pre_call` — so
+    /// callers and off-chain dashboards get an accurate picture of recoverability
+    /// without needing to trigger a real call first.
+    ///
+    /// The recomputed state is **not** persisted; storage is only mutated by
+    /// `pre_call` (via `check_and_transition`). (Issue #1318)
     pub fn circuit_breaker_state(env: Env, route: String) -> Option<CircuitBreakerState> {
         let route_call_state: RouteCallState = env
             .storage()
             .instance()
-            .get(&DataKey::RouteCallState(route))?;
-        Some(route_call_state.circuit_breaker)
+            .get(&DataKey::RouteCallState(route.clone()))?;
+
+        let mut cb = route_call_state.circuit_breaker.clone();
+
+        // If the circuit is open, check whether the recovery window has elapsed
+        // and reflect the open→half-open transition that the next pre_call would
+        // make — without persisting it. This mirrors rate_limit_state's
+        // compute-but-don't-persist pattern. (Issue #1318)
+        if cb.is_open {
+            if let Some(config) = env
+                .storage()
+                .instance()
+                .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route))
+            {
+                let recovers = config.recovery_window_seconds > 0
+                    && env.ledger().timestamp()
+                        >= cb.opened_at + config.recovery_window_seconds;
+                if recovers {
+                    cb.is_open = false;
+                    cb.is_half_open = true;
+                }
+            }
+        }
+
+        Some(cb)
     }
 
     /// Get current admin.
@@ -1691,8 +1726,110 @@ mod tests {
         assert!(!state.is_open);
     }
 
+    // ── Issue #1318: circuit_breaker_state must recompute stale open state ────
+
+    /// After the recovery window elapses, circuit_breaker_state must report
+    /// is_open: false / is_half_open: true even if no pre_call has run yet.
+    /// Before the fix it returned the raw persisted struct, so callers polling
+    /// this view got a false "still open" result and backed off unnecessarily.
     #[test]
-    fn test_call_log_never_exceeds_retention() {
+    fn test_circuit_breaker_state_reflects_recovery_without_pre_call() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // failure_threshold=1, recovery_window=60s
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &60, &0, &0);
+        let caller = Address::generate(&env);
+
+        // Trip the circuit.
+        client.post_call(&caller, &route, &false);
+
+        // Immediately: still open.
+        let state_open = client.circuit_breaker_state(&route).unwrap();
+        assert!(state_open.is_open, "circuit must be open after failure");
+        assert!(!state_open.is_half_open);
+
+        // Advance past the recovery window WITHOUT calling pre_call.
+        env.ledger().with_mut(|l| l.timestamp += 61);
+
+        // circuit_breaker_state must now report the recovered (half-open) state.
+        let state_after_recovery = client.circuit_breaker_state(&route).unwrap();
+        assert!(
+            !state_after_recovery.is_open,
+            "circuit_breaker_state must report is_open: false after recovery window elapsed"
+        );
+        assert!(
+            state_after_recovery.is_half_open,
+            "circuit_breaker_state must report is_half_open: true after recovery window elapsed"
+        );
+    }
+
+    /// circuit_breaker_state must not persist the recomputed transition —
+    /// subsequent calls to the view must return the same logical result, and
+    /// only a real pre_call (which calls check_and_transition) should mutate
+    /// the persisted state.
+    #[test]
+    fn test_circuit_breaker_state_recompute_does_not_persist() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &60, &0, &0);
+        let caller = Address::generate(&env);
+
+        client.post_call(&caller, &route, &false);
+        env.ledger().with_mut(|l| l.timestamp += 61);
+
+        // Read the view twice — must return the same half-open result each time.
+        let first_read = client.circuit_breaker_state(&route).unwrap();
+        let second_read = client.circuit_breaker_state(&route).unwrap();
+        assert!(!first_read.is_open);
+        assert!(first_read.is_half_open);
+        assert_eq!(first_read, second_read);
+    }
+
+    /// When the recovery window has NOT yet elapsed, circuit_breaker_state
+    /// must still report is_open: true (no premature recompute).
+    #[test]
+    fn test_circuit_breaker_state_still_open_before_recovery_window() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &60, &0, &0);
+        let caller = Address::generate(&env);
+
+        client.post_call(&caller, &route, &false);
+
+        // Advance time but not past the 60 s recovery window.
+        env.ledger().with_mut(|l| l.timestamp += 30);
+
+        let state = client.circuit_breaker_state(&route).unwrap();
+        assert!(
+            state.is_open,
+            "circuit must still be reported as open before the recovery window elapses"
+        );
+        assert!(!state.is_half_open);
+    }
+
+    /// When recovery_window_seconds is 0 (no auto-recovery configured),
+    /// circuit_breaker_state must never flip to half-open regardless of
+    /// elapsed time — mirroring check_and_transition's own guard.
+    #[test]
+    fn test_circuit_breaker_state_no_recovery_when_window_zero() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // recovery_window_seconds = 0 means "never auto-recover"
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &0, &0, &0);
+        let caller = Address::generate(&env);
+
+        client.post_call(&caller, &route, &false);
+        env.ledger().with_mut(|l| l.timestamp += 9999);
+
+        let state = client.circuit_breaker_state(&route).unwrap();
+        assert!(
+            state.is_open,
+            "with recovery_window_seconds=0, circuit must never auto-recover"
+        );
+        assert!(!state.is_half_open);
+    }
+
+
         let (env, admin, client) = setup();
         let route = String::from_str(&env, "oracle/get_price");
         client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &3, &0);
