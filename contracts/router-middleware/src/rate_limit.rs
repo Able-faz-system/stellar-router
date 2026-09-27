@@ -31,6 +31,30 @@ pub struct RateLimitCheck {
     pub updated_state: RateLimitState,
 }
 
+/// Resolve the effective rate-limit window for `caller` on `route`.
+///
+/// Returns the caller's `CallerRateLimitConfig.window_secs` when a per-caller
+/// override is stored for `(route, caller)`, otherwise falls back to
+/// `base_window_seconds` from the route-level config.  This is the single
+/// source of truth used by `pre_call`, `rate_limit_state`, and
+/// `get_route_rate_limit_stats` so window-elapsed arithmetic is never
+/// duplicated across call sites. (Issue #1317)
+pub fn resolve_effective_window(
+    env: &Env,
+    route: &String,
+    caller: &Address,
+    base_window_seconds: u64,
+) -> u64 {
+    env.storage()
+        .instance()
+        .get::<crate::DataKey, crate::CallerRateLimitConfig>(&crate::DataKey::CallerRateLimit(
+            route.clone(),
+            caller.clone(),
+        ))
+        .map(|c| c.window_secs)
+        .unwrap_or(base_window_seconds)
+}
+
 /// Check and compute the updated rate limit state for `caller` on a route,
 /// given the already-resolved `effective_limit` / `effective_window` (which
 /// may come from the route default or a per-caller override).

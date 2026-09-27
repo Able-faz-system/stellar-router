@@ -335,6 +335,13 @@ impl RouterMiddleware {
     /// In the unlikely event the flag is left set (e.g. by a future panic
     /// path), an admin can call `reset_guard(route)` to recover.
     pub fn pre_call(env: Env, caller: Address, route: String) -> Result<(), MiddlewareError> {
+        // ── Auth: caller must authorise this invocation ──────────────────────
+        // Without this check any account could call pre_call with an arbitrary
+        // `caller` address, forging rate-limit quotas, circuit-breaker state,
+        // and call-log attribution for addresses that never signed anything.
+        // (Issue #1315)
+        caller.require_auth();
+
         // ── Reentrancy guard: set ────────────────────────────────────────────
         if env
             .storage()
@@ -423,6 +430,11 @@ impl RouterMiddleware {
             // Rate limit check: enforce route-level limit only if set, but always
             // check for per-caller overrides even when route is unlimited (max_calls_per_window = 0).
             // This allows admins to throttle specific abusive callers on otherwise-unlimited routes.
+            //
+            // A per-caller override of {max_calls: 0, window_secs: 0} mirrors the
+            // route-level convention where max_calls_per_window == 0 means "unlimited".
+            // We must not enter the enforcement branch for such an override.
+            // (Issue #1316)
             let caller_override: Option<CallerRateLimitConfig> = env
                 .storage()
                 .instance()
@@ -430,10 +442,18 @@ impl RouterMiddleware {
                 &DataKey::CallerRateLimit(route.clone(), caller.clone()),
             );
 
-            if config.max_calls_per_window > 0 || caller_override.is_some() {
+            // An override is "active" (i.e. actually enforces a limit) only when
+            // max_calls > 0.  An override stored as {0, 0} means unlimited for
+            // that caller — identical to how the route-level 0 is treated.
+            let active_override = caller_override
+                .as_ref()
+                .filter(|c| c.max_calls > 0)
+                .cloned();
+
+            if config.max_calls_per_window > 0 || active_override.is_some() {
                 // Resolve effective limit: per-caller override takes precedence
                 // over the route-level default when present.
-                let (effective_limit, effective_window) = caller_override
+                let (effective_limit, effective_window) = active_override
                     .map(|c| (c.max_calls, c.window_secs))
                     .unwrap_or((
                         config
@@ -553,6 +573,13 @@ impl RouterMiddleware {
 
     /// Post-call hook: tracks failures and manages circuit breaker.
     pub fn post_call(env: Env, caller: Address, route: String, success: bool) {
+        // ── Auth: caller must authorise this invocation ──────────────────────
+        // Without this check any account could forge call-log entries, trip
+        // the circuit breaker, or reset it, all while attributing the action
+        // to an arbitrary `caller` address that never signed anything.
+        // (Issue #1315)
+        caller.require_auth();
+
         env.events().publish(
             (Symbol::new(&env, router_common::EVENT_POST_CALL),),
             (caller.clone(), route.clone(), success),
@@ -717,20 +744,31 @@ impl RouterMiddleware {
     }
 
     /// Get rate limit state for a caller on a specific route.
+    ///
+    /// Like `pre_call`, this function resolves the caller's *effective* window:
+    /// it uses the per-caller `CallerRateLimitConfig.window_secs` when an
+    /// override is stored for `(route, caller)`, falling back to the route-level
+    /// `window_seconds` otherwise.  This ensures the view reflects the same
+    /// window that enforcement uses, so integrators can accurately predict
+    /// whether the next `pre_call` will succeed. (Issue #1317)
     pub fn rate_limit_state(env: Env, route: String, caller: Address) -> Option<RateLimitState> {
         let route_call_state: RouteCallState = env
             .storage()
             .instance()
             .get(&DataKey::RouteCallState(route.clone()))?;
-        let state: RateLimitState = route_call_state.rate_limits.get(caller)?;
+        let state: RateLimitState = route_call_state.rate_limits.get(caller.clone())?;
 
         if let Some(config) = env
             .storage()
             .instance()
-            .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route))
+            .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
         {
             let now = env.ledger().timestamp();
-            let window_elapsed = now >= state.window_start + config.window_seconds;
+            // Resolve the effective window using the same helper that pre_call
+            // uses, so the view is always consistent with enforcement.
+            let effective_window =
+                rate_limit::resolve_effective_window(&env, &route, &caller, config.window_seconds);
+            let window_elapsed = now >= state.window_start + effective_window;
 
             if window_elapsed {
                 Some(RateLimitState {
@@ -756,6 +794,14 @@ impl RouterMiddleware {
     }
 
     /// Get aggregated rate limit statistics for a route across all callers.
+    ///
+    /// Each caller's window-elapsed determination uses their *effective* window
+    /// (per-caller override when present, route-level default otherwise), via
+    /// `rate_limit::resolve_effective_window` — the same helper used by
+    /// `pre_call` and `rate_limit_state`.  Previously this function always used
+    /// the route-level `window_seconds` for every caller, producing incorrect
+    /// `calls_in_window` counts for callers with an override window that differs
+    /// from the route default. (Issue #1317)
     pub fn get_route_rate_limit_stats(env: Env, route: String) -> Option<RouteRateLimitStats> {
         let route_call_state: RouteCallState = env
             .storage()
@@ -776,9 +822,18 @@ impl RouterMiddleware {
             .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()));
         let now = env.ledger().timestamp();
 
-        for (_caller, state) in route_call_state.rate_limits.iter() {
+        for (caller, state) in route_call_state.rate_limits.iter() {
             let (calls, window_start) = if let Some(ref cfg) = config {
-                let window_elapsed = now >= state.window_start + cfg.window_seconds;
+                // Resolve the effective window for this specific caller so
+                // callers with a per-caller override are checked against their
+                // own window, not the route's base window. (Issue #1317)
+                let effective_window = rate_limit::resolve_effective_window(
+                    &env,
+                    &route,
+                    &caller,
+                    cfg.window_seconds,
+                );
+                let window_elapsed = now >= state.window_start + effective_window;
                 if window_elapsed {
                     (0, now)
                 } else {
@@ -837,12 +892,47 @@ impl RouterMiddleware {
     }
 
     /// Get the current circuit breaker state for a route.
+    ///
+    /// Like `rate_limit_state`, this function recomputes elapsed-state before
+    /// returning so the view reflects reality even if no `pre_call` has run
+    /// since the recovery window ended.  Specifically, when the circuit is open
+    /// and the recovery window has already elapsed, this function returns a
+    /// state with `is_open: false` / `is_half_open: true` — the same transition
+    /// that `check_and_transition` would make on the next real `pre_call` — so
+    /// callers and off-chain dashboards get an accurate picture of recoverability
+    /// without needing to trigger a real call first.
+    ///
+    /// The recomputed state is **not** persisted; storage is only mutated by
+    /// `pre_call` (via `check_and_transition`). (Issue #1318)
     pub fn circuit_breaker_state(env: Env, route: String) -> Option<CircuitBreakerState> {
         let route_call_state: RouteCallState = env
             .storage()
             .instance()
-            .get(&DataKey::RouteCallState(route))?;
-        Some(route_call_state.circuit_breaker)
+            .get(&DataKey::RouteCallState(route.clone()))?;
+
+        let mut cb = route_call_state.circuit_breaker.clone();
+
+        // If the circuit is open, check whether the recovery window has elapsed
+        // and reflect the open→half-open transition that the next pre_call would
+        // make — without persisting it. This mirrors rate_limit_state's
+        // compute-but-don't-persist pattern. (Issue #1318)
+        if cb.is_open {
+            if let Some(config) = env
+                .storage()
+                .instance()
+                .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route))
+            {
+                let recovers = config.recovery_window_seconds > 0
+                    && env.ledger().timestamp()
+                        >= cb.opened_at + config.recovery_window_seconds;
+                if recovers {
+                    cb.is_open = false;
+                    cb.is_half_open = true;
+                }
+            }
+        }
+
+        Some(cb)
     }
 
     /// Get current admin.
@@ -1018,6 +1108,14 @@ impl RouterMiddleware {
     }
 
     /// Check whether a specific caller has exceeded their per-caller rate limit.
+    ///
+    /// Returns `Ok(true)` when the caller is within their limit (i.e. the next
+    /// `pre_call` would succeed from a rate-limit perspective) and `Ok(false)`
+    /// when they have exhausted it.
+    ///
+    /// A stored override of `{max_calls: 0, window_secs: 0}` means "unlimited"
+    /// (mirroring the route-level `max_calls_per_window == 0` convention), so
+    /// this function returns `Ok(true)` for such an override. (Issue #1316)
     pub fn check_caller_rate_limit(
         env: Env,
         route: String,
@@ -1029,6 +1127,12 @@ impl RouterMiddleware {
             .instance()
             .get::<DataKey, CallerRateLimitConfig>(&key)
         {
+            // max_calls == 0 means unlimited for this caller — consistent with
+            // how the route-level max_calls_per_window == 0 is treated.
+            if config.max_calls == 0 {
+                return Ok(true);
+            }
+
             let route_call_state: RouteCallState = env
                 .storage()
                 .instance()
@@ -1287,6 +1391,56 @@ mod tests {
 
         client.post_call(&caller, &route, &true);
         client.post_call(&caller, &route, &false);
+    }
+
+    // ── Issue #1315: pre_call and post_call must require_auth on caller ───────
+
+    /// post_call requires the caller to authorise; without mock_all_auths the
+    /// call must fail.  (pre_call already had require_auth before this fix;
+    /// this test documents that post_call now enforces it too.)
+    #[test]
+    fn test_post_call_requires_caller_auth() {
+        // Use a fresh Env WITHOUT mock_all_auths so auth is actually enforced.
+        let env = Env::default();
+        env.ledger().set_timestamp(123456);
+        let contract_id = env.register_contract(None, RouterMiddleware);
+        let client = RouterMiddlewareClient::new(&env, &contract_id);
+        // initialize needs auth; mock just for that one call
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        // Drop mock_all_auths — from here auth is real.
+        // A fresh Env without mocking will panic/trap on require_auth if the
+        // invoker didn't sign.  We verify via try_ that it traps (Err).
+        // In Soroban SDK tests an unauthorized require_auth panics the
+        // contract, so try_post_call returns Err(Err(..)).
+        let victim = Address::generate(&env);
+        let route = String::from_str(&env, "oracle/get_price");
+        let result = client.try_post_call(&victim, &route, &false);
+        assert!(
+            result.is_err(),
+            "post_call must fail when caller has not authorised"
+        );
+    }
+
+    /// pre_call requires the caller to authorise; without mock_all_auths the
+    /// call must fail.
+    #[test]
+    fn test_pre_call_requires_caller_auth() {
+        let env = Env::default();
+        env.ledger().set_timestamp(123456);
+        let contract_id = env.register_contract(None, RouterMiddleware);
+        let client = RouterMiddlewareClient::new(&env, &contract_id);
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        client.initialize(&admin);
+        let victim = Address::generate(&env);
+        let route = String::from_str(&env, "oracle/get_price");
+        let result = client.try_pre_call(&victim, &route);
+        assert!(
+            result.is_err(),
+            "pre_call must fail when caller has not authorised"
+        );
     }
 
     #[test]
@@ -1572,8 +1726,110 @@ mod tests {
         assert!(!state.is_open);
     }
 
+    // ── Issue #1318: circuit_breaker_state must recompute stale open state ────
+
+    /// After the recovery window elapses, circuit_breaker_state must report
+    /// is_open: false / is_half_open: true even if no pre_call has run yet.
+    /// Before the fix it returned the raw persisted struct, so callers polling
+    /// this view got a false "still open" result and backed off unnecessarily.
     #[test]
-    fn test_call_log_never_exceeds_retention() {
+    fn test_circuit_breaker_state_reflects_recovery_without_pre_call() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // failure_threshold=1, recovery_window=60s
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &60, &0, &0);
+        let caller = Address::generate(&env);
+
+        // Trip the circuit.
+        client.post_call(&caller, &route, &false);
+
+        // Immediately: still open.
+        let state_open = client.circuit_breaker_state(&route).unwrap();
+        assert!(state_open.is_open, "circuit must be open after failure");
+        assert!(!state_open.is_half_open);
+
+        // Advance past the recovery window WITHOUT calling pre_call.
+        env.ledger().with_mut(|l| l.timestamp += 61);
+
+        // circuit_breaker_state must now report the recovered (half-open) state.
+        let state_after_recovery = client.circuit_breaker_state(&route).unwrap();
+        assert!(
+            !state_after_recovery.is_open,
+            "circuit_breaker_state must report is_open: false after recovery window elapsed"
+        );
+        assert!(
+            state_after_recovery.is_half_open,
+            "circuit_breaker_state must report is_half_open: true after recovery window elapsed"
+        );
+    }
+
+    /// circuit_breaker_state must not persist the recomputed transition —
+    /// subsequent calls to the view must return the same logical result, and
+    /// only a real pre_call (which calls check_and_transition) should mutate
+    /// the persisted state.
+    #[test]
+    fn test_circuit_breaker_state_recompute_does_not_persist() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &60, &0, &0);
+        let caller = Address::generate(&env);
+
+        client.post_call(&caller, &route, &false);
+        env.ledger().with_mut(|l| l.timestamp += 61);
+
+        // Read the view twice — must return the same half-open result each time.
+        let first_read = client.circuit_breaker_state(&route).unwrap();
+        let second_read = client.circuit_breaker_state(&route).unwrap();
+        assert!(!first_read.is_open);
+        assert!(first_read.is_half_open);
+        assert_eq!(first_read, second_read);
+    }
+
+    /// When the recovery window has NOT yet elapsed, circuit_breaker_state
+    /// must still report is_open: true (no premature recompute).
+    #[test]
+    fn test_circuit_breaker_state_still_open_before_recovery_window() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &60, &0, &0);
+        let caller = Address::generate(&env);
+
+        client.post_call(&caller, &route, &false);
+
+        // Advance time but not past the 60 s recovery window.
+        env.ledger().with_mut(|l| l.timestamp += 30);
+
+        let state = client.circuit_breaker_state(&route).unwrap();
+        assert!(
+            state.is_open,
+            "circuit must still be reported as open before the recovery window elapses"
+        );
+        assert!(!state.is_half_open);
+    }
+
+    /// When recovery_window_seconds is 0 (no auto-recovery configured),
+    /// circuit_breaker_state must never flip to half-open regardless of
+    /// elapsed time — mirroring check_and_transition's own guard.
+    #[test]
+    fn test_circuit_breaker_state_no_recovery_when_window_zero() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // recovery_window_seconds = 0 means "never auto-recover"
+        client.configure_route(&admin, &route, &0, &0, &true, &1, &0, &0, &0);
+        let caller = Address::generate(&env);
+
+        client.post_call(&caller, &route, &false);
+        env.ledger().with_mut(|l| l.timestamp += 9999);
+
+        let state = client.circuit_breaker_state(&route).unwrap();
+        assert!(
+            state.is_open,
+            "with recovery_window_seconds=0, circuit must never auto-recover"
+        );
+        assert!(!state.is_half_open);
+    }
+
+
         let (env, admin, client) = setup();
         let route = String::from_str(&env, "oracle/get_price");
         client.configure_route(&admin, &route, &0, &0, &true, &0, &0, &3, &0);
@@ -1651,6 +1907,79 @@ mod tests {
         assert_eq!(
             state_still_in_window.window_start, state.window_start,
             "window_start should not change within window"
+        );
+    }
+
+    // ── Issue #1317: view functions must use per-caller effective window ──────
+
+    /// rate_limit_state must use the caller's override window (10 s), not the
+    /// route's base window (60 s).  After 15 s the override window has elapsed
+    /// but the route window has not.  Before the fix the view reported stale
+    /// nonzero calls because it used 60 s for the elapsed check.
+    #[test]
+    fn test_rate_limit_state_uses_caller_override_window() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // Route: 60 s window, 10 calls max.
+        client.configure_route(&admin, &route, &10, &60, &true, &0, &0, &0, &0);
+        let caller = Address::generate(&env);
+        // Override: 10 s window, 5 calls max.
+        client.configure_caller_rate_limit(&admin, &route, &caller, &5, &10);
+
+        // Make 3 calls inside the override window.
+        client.pre_call(&caller, &route);
+        client.pre_call(&caller, &route);
+        client.pre_call(&caller, &route);
+
+        let t0 = env.ledger().timestamp();
+
+        let mid_window = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(mid_window.calls_in_window, 3, "3 calls inside the 10 s override window");
+
+        // Advance 15 s — past the 10 s override window but well before the 60 s route window.
+        env.ledger().set_timestamp(t0 + 15);
+
+        let after_override_window = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(
+            after_override_window.calls_in_window, 0,
+            "override window elapsed: rate_limit_state must report 0, not stale counts"
+        );
+    }
+
+    /// get_route_rate_limit_stats must also use each caller's effective window.
+    /// A caller whose override window (10 s) has elapsed must contribute 0 calls
+    /// to the aggregate, even if the route's base window (60 s) has not elapsed.
+    #[test]
+    fn test_get_route_rate_limit_stats_uses_per_caller_effective_window() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // Route: 60 s window, 10 calls max.
+        client.configure_route(&admin, &route, &10, &60, &true, &0, &0, &0, &0);
+        let caller_with_override = Address::generate(&env);
+        let caller_without_override = Address::generate(&env);
+        // Override for first caller: 10 s window.
+        client.configure_caller_rate_limit(&admin, &route, &caller_with_override, &5, &10);
+
+        let t0 = env.ledger().timestamp();
+
+        // Both callers make 2 calls inside their respective windows.
+        client.pre_call(&caller_with_override, &route);
+        client.pre_call(&caller_with_override, &route);
+        client.pre_call(&caller_without_override, &route);
+        client.pre_call(&caller_without_override, &route);
+
+        let stats_before = client.get_route_rate_limit_stats(&route).unwrap();
+        assert_eq!(stats_before.total_calls_in_window, 4);
+
+        // Advance 15 s — override window (10 s) has elapsed, route window (60 s) has not.
+        env.ledger().set_timestamp(t0 + 15);
+
+        let stats_after = client.get_route_rate_limit_stats(&route).unwrap();
+        // caller_with_override's window expired → 0 calls from them.
+        // caller_without_override's 60 s window still active → 2 calls still counted.
+        assert_eq!(
+            stats_after.total_calls_in_window, 2,
+            "only the caller whose window is still active should be counted"
         );
     }
 
@@ -2673,7 +3002,73 @@ mod tests {
             .is_ok());
     }
 
-    // ── Reentrancy guard tests ────────────────────────────────────────────────
+    // ── Issue #1316: per-caller override {0, 0} must mean unlimited ──────────
+
+    /// An admin who sets a (0, 0) per-caller override must grant the caller
+    /// unlimited access, not lock them out.  Before the fix, `pre_call` entered
+    /// the enforcement branch because caller_override.is_some() was true, and
+    /// check_and_increment computed 0 >= 0 → exceeded on the very first call.
+    #[test]
+    fn test_caller_override_zero_zero_means_unlimited_pre_call() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // Route has a tight limit of 2 calls per window.
+        client.configure_route(&admin, &route, &2, &60, &true, &0, &0, &0, &0);
+        let caller = Address::generate(&env);
+        // Grant caller an "unlimited" override using the 0/0 convention.
+        client.configure_caller_rate_limit(&admin, &route, &caller, &0, &0);
+
+        // The caller should be able to make many more than 2 calls.
+        for _ in 0..10 {
+            assert!(
+                client.try_pre_call(&caller, &route).is_ok(),
+                "pre_call must succeed for a caller with a (0,0) unlimited override"
+            );
+        }
+    }
+
+    /// check_caller_rate_limit must also return true (not exceeded) for a (0,0)
+    /// override, since max_calls == 0 means unlimited.
+    #[test]
+    fn test_check_caller_rate_limit_zero_zero_override_returns_true() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &2, &60, &true, &0, &0, &0, &0);
+        let caller = Address::generate(&env);
+        client.configure_caller_rate_limit(&admin, &route, &caller, &0, &0);
+
+        // check_caller_rate_limit must report "not exceeded" (true).
+        assert!(
+            client.check_caller_rate_limit(&route, &caller),
+            "check_caller_rate_limit must return true for a (0,0) unlimited override"
+        );
+    }
+
+    /// A normal caller on the same route is still subject to the route-level
+    /// limit even when another caller has a (0,0) unlimited override.
+    #[test]
+    fn test_caller_override_zero_zero_does_not_affect_other_callers() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &2, &60, &true, &0, &0, &0, &0);
+        let unlimited_caller = Address::generate(&env);
+        let normal_caller = Address::generate(&env);
+        client.configure_caller_rate_limit(&admin, &route, &unlimited_caller, &0, &0);
+
+        // Unlimited caller goes through freely.
+        for _ in 0..5 {
+            assert!(client.try_pre_call(&unlimited_caller, &route).is_ok());
+        }
+        // Normal caller still hits the route-level cap of 2.
+        assert!(client.try_pre_call(&normal_caller, &route).is_ok());
+        assert!(client.try_pre_call(&normal_caller, &route).is_ok());
+        assert_eq!(
+            client.try_pre_call(&normal_caller, &route),
+            Err(Ok(MiddlewareError::RateLimitExceeded))
+        );
+    }
+
+
 
     /// pre_call on a route whose `Executing` guard is already set (i.e. a call
     /// is in flight on that route) must return Reentrancy. Soroban's test env
