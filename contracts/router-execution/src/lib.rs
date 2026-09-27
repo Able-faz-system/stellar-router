@@ -2033,4 +2033,53 @@ mod tests {
         assert_eq!(evt_function, function);
         assert!(evt_success);
     }
+
+    // ── Issue #1313: ArgsTooLarge guard coverage for execute() and simulate() ─
+    //
+    // Both execute() (line 386-388) and simulate() (line 616-618) reject
+    // argument vectors longer than MAX_ARGS_PER_CALL (20). Neither entry point
+    // has any existing test that exercises this guard.
+
+    #[test]
+    fn test_execute_args_too_large_returns_error() {
+        let (env, _, client) = setup();
+        let caller = Address::generate(&env);
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "transfer");
+
+        // Build a Vec<Val> with 21 elements (MAX_ARGS_PER_CALL + 1).
+        let mut oversized_args: Vec<Val> = Vec::new(&env);
+        for i in 0u32..21u32 {
+            oversized_args.push_back(i.into_val(&env));
+        }
+
+        let request = ExecutionRequest {
+            target: target.clone(),
+            function: function.clone(),
+            simulate_first: false,
+            max_retries: 0,
+            args: oversized_args,
+            amount: 1_000_000,
+        };
+
+        let result = client.try_execute(&caller, &request);
+        assert_eq!(result, Err(Ok(ExecutionError::ArgsTooLarge)));
+    }
+
+    #[test]
+    fn test_simulate_args_too_large_returns_error() {
+        let (env, _, client) = setup();
+        let caller = Address::generate(&env);
+        let target = Address::generate(&env);
+        let function = Symbol::new(&env, "transfer");
+
+        // Build a Vec<Val> with 21 elements (MAX_ARGS_PER_CALL + 1).
+        let mut oversized_args: Vec<Val> = Vec::new(&env);
+        for i in 0u32..21u32 {
+            oversized_args.push_back(i.into_val(&env));
+        }
+
+        let result = client.try_simulate(&caller, &target, &function, &oversized_args);
+        assert_eq!(result, Err(Ok(ExecutionError::ArgsTooLarge)));
+    }
 }
