@@ -430,6 +430,11 @@ impl RouterMiddleware {
             // Rate limit check: enforce route-level limit only if set, but always
             // check for per-caller overrides even when route is unlimited (max_calls_per_window = 0).
             // This allows admins to throttle specific abusive callers on otherwise-unlimited routes.
+            //
+            // A per-caller override of {max_calls: 0, window_secs: 0} mirrors the
+            // route-level convention where max_calls_per_window == 0 means "unlimited".
+            // We must not enter the enforcement branch for such an override.
+            // (Issue #1316)
             let caller_override: Option<CallerRateLimitConfig> = env
                 .storage()
                 .instance()
@@ -437,10 +442,18 @@ impl RouterMiddleware {
                 &DataKey::CallerRateLimit(route.clone(), caller.clone()),
             );
 
-            if config.max_calls_per_window > 0 || caller_override.is_some() {
+            // An override is "active" (i.e. actually enforces a limit) only when
+            // max_calls > 0.  An override stored as {0, 0} means unlimited for
+            // that caller — identical to how the route-level 0 is treated.
+            let active_override = caller_override
+                .as_ref()
+                .filter(|c| c.max_calls > 0)
+                .cloned();
+
+            if config.max_calls_per_window > 0 || active_override.is_some() {
                 // Resolve effective limit: per-caller override takes precedence
                 // over the route-level default when present.
-                let (effective_limit, effective_window) = caller_override
+                let (effective_limit, effective_window) = active_override
                     .map(|c| (c.max_calls, c.window_secs))
                     .unwrap_or((
                         config
@@ -1032,6 +1045,14 @@ impl RouterMiddleware {
     }
 
     /// Check whether a specific caller has exceeded their per-caller rate limit.
+    ///
+    /// Returns `Ok(true)` when the caller is within their limit (i.e. the next
+    /// `pre_call` would succeed from a rate-limit perspective) and `Ok(false)`
+    /// when they have exhausted it.
+    ///
+    /// A stored override of `{max_calls: 0, window_secs: 0}` means "unlimited"
+    /// (mirroring the route-level `max_calls_per_window == 0` convention), so
+    /// this function returns `Ok(true)` for such an override. (Issue #1316)
     pub fn check_caller_rate_limit(
         env: Env,
         route: String,
@@ -1043,6 +1064,12 @@ impl RouterMiddleware {
             .instance()
             .get::<DataKey, CallerRateLimitConfig>(&key)
         {
+            // max_calls == 0 means unlimited for this caller — consistent with
+            // how the route-level max_calls_per_window == 0 is treated.
+            if config.max_calls == 0 {
+                return Ok(true);
+            }
+
             let route_call_state: RouteCallState = env
                 .storage()
                 .instance()
@@ -2737,7 +2764,73 @@ mod tests {
             .is_ok());
     }
 
-    // ── Reentrancy guard tests ────────────────────────────────────────────────
+    // ── Issue #1316: per-caller override {0, 0} must mean unlimited ──────────
+
+    /// An admin who sets a (0, 0) per-caller override must grant the caller
+    /// unlimited access, not lock them out.  Before the fix, `pre_call` entered
+    /// the enforcement branch because caller_override.is_some() was true, and
+    /// check_and_increment computed 0 >= 0 → exceeded on the very first call.
+    #[test]
+    fn test_caller_override_zero_zero_means_unlimited_pre_call() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // Route has a tight limit of 2 calls per window.
+        client.configure_route(&admin, &route, &2, &60, &true, &0, &0, &0, &0);
+        let caller = Address::generate(&env);
+        // Grant caller an "unlimited" override using the 0/0 convention.
+        client.configure_caller_rate_limit(&admin, &route, &caller, &0, &0);
+
+        // The caller should be able to make many more than 2 calls.
+        for _ in 0..10 {
+            assert!(
+                client.try_pre_call(&caller, &route).is_ok(),
+                "pre_call must succeed for a caller with a (0,0) unlimited override"
+            );
+        }
+    }
+
+    /// check_caller_rate_limit must also return true (not exceeded) for a (0,0)
+    /// override, since max_calls == 0 means unlimited.
+    #[test]
+    fn test_check_caller_rate_limit_zero_zero_override_returns_true() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &2, &60, &true, &0, &0, &0, &0);
+        let caller = Address::generate(&env);
+        client.configure_caller_rate_limit(&admin, &route, &caller, &0, &0);
+
+        // check_caller_rate_limit must report "not exceeded" (true).
+        assert!(
+            client.check_caller_rate_limit(&route, &caller),
+            "check_caller_rate_limit must return true for a (0,0) unlimited override"
+        );
+    }
+
+    /// A normal caller on the same route is still subject to the route-level
+    /// limit even when another caller has a (0,0) unlimited override.
+    #[test]
+    fn test_caller_override_zero_zero_does_not_affect_other_callers() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        client.configure_route(&admin, &route, &2, &60, &true, &0, &0, &0, &0);
+        let unlimited_caller = Address::generate(&env);
+        let normal_caller = Address::generate(&env);
+        client.configure_caller_rate_limit(&admin, &route, &unlimited_caller, &0, &0);
+
+        // Unlimited caller goes through freely.
+        for _ in 0..5 {
+            assert!(client.try_pre_call(&unlimited_caller, &route).is_ok());
+        }
+        // Normal caller still hits the route-level cap of 2.
+        assert!(client.try_pre_call(&normal_caller, &route).is_ok());
+        assert!(client.try_pre_call(&normal_caller, &route).is_ok());
+        assert_eq!(
+            client.try_pre_call(&normal_caller, &route),
+            Err(Ok(MiddlewareError::RateLimitExceeded))
+        );
+    }
+
+
 
     /// pre_call on a route whose `Executing` guard is already set (i.e. a call
     /// is in flight on that route) must return Reentrancy. Soroban's test env
