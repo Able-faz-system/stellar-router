@@ -744,20 +744,31 @@ impl RouterMiddleware {
     }
 
     /// Get rate limit state for a caller on a specific route.
+    ///
+    /// Like `pre_call`, this function resolves the caller's *effective* window:
+    /// it uses the per-caller `CallerRateLimitConfig.window_secs` when an
+    /// override is stored for `(route, caller)`, falling back to the route-level
+    /// `window_seconds` otherwise.  This ensures the view reflects the same
+    /// window that enforcement uses, so integrators can accurately predict
+    /// whether the next `pre_call` will succeed. (Issue #1317)
     pub fn rate_limit_state(env: Env, route: String, caller: Address) -> Option<RateLimitState> {
         let route_call_state: RouteCallState = env
             .storage()
             .instance()
             .get(&DataKey::RouteCallState(route.clone()))?;
-        let state: RateLimitState = route_call_state.rate_limits.get(caller)?;
+        let state: RateLimitState = route_call_state.rate_limits.get(caller.clone())?;
 
         if let Some(config) = env
             .storage()
             .instance()
-            .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route))
+            .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()))
         {
             let now = env.ledger().timestamp();
-            let window_elapsed = now >= state.window_start + config.window_seconds;
+            // Resolve the effective window using the same helper that pre_call
+            // uses, so the view is always consistent with enforcement.
+            let effective_window =
+                rate_limit::resolve_effective_window(&env, &route, &caller, config.window_seconds);
+            let window_elapsed = now >= state.window_start + effective_window;
 
             if window_elapsed {
                 Some(RateLimitState {
@@ -783,6 +794,14 @@ impl RouterMiddleware {
     }
 
     /// Get aggregated rate limit statistics for a route across all callers.
+    ///
+    /// Each caller's window-elapsed determination uses their *effective* window
+    /// (per-caller override when present, route-level default otherwise), via
+    /// `rate_limit::resolve_effective_window` — the same helper used by
+    /// `pre_call` and `rate_limit_state`.  Previously this function always used
+    /// the route-level `window_seconds` for every caller, producing incorrect
+    /// `calls_in_window` counts for callers with an override window that differs
+    /// from the route default. (Issue #1317)
     pub fn get_route_rate_limit_stats(env: Env, route: String) -> Option<RouteRateLimitStats> {
         let route_call_state: RouteCallState = env
             .storage()
@@ -803,9 +822,18 @@ impl RouterMiddleware {
             .get::<DataKey, RouteConfig>(&DataKey::RouteConfig(route.clone()));
         let now = env.ledger().timestamp();
 
-        for (_caller, state) in route_call_state.rate_limits.iter() {
+        for (caller, state) in route_call_state.rate_limits.iter() {
             let (calls, window_start) = if let Some(ref cfg) = config {
-                let window_elapsed = now >= state.window_start + cfg.window_seconds;
+                // Resolve the effective window for this specific caller so
+                // callers with a per-caller override are checked against their
+                // own window, not the route's base window. (Issue #1317)
+                let effective_window = rate_limit::resolve_effective_window(
+                    &env,
+                    &route,
+                    &caller,
+                    cfg.window_seconds,
+                );
+                let window_elapsed = now >= state.window_start + effective_window;
                 if window_elapsed {
                     (0, now)
                 } else {
@@ -1742,6 +1770,79 @@ mod tests {
         assert_eq!(
             state_still_in_window.window_start, state.window_start,
             "window_start should not change within window"
+        );
+    }
+
+    // ── Issue #1317: view functions must use per-caller effective window ──────
+
+    /// rate_limit_state must use the caller's override window (10 s), not the
+    /// route's base window (60 s).  After 15 s the override window has elapsed
+    /// but the route window has not.  Before the fix the view reported stale
+    /// nonzero calls because it used 60 s for the elapsed check.
+    #[test]
+    fn test_rate_limit_state_uses_caller_override_window() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // Route: 60 s window, 10 calls max.
+        client.configure_route(&admin, &route, &10, &60, &true, &0, &0, &0, &0);
+        let caller = Address::generate(&env);
+        // Override: 10 s window, 5 calls max.
+        client.configure_caller_rate_limit(&admin, &route, &caller, &5, &10);
+
+        // Make 3 calls inside the override window.
+        client.pre_call(&caller, &route);
+        client.pre_call(&caller, &route);
+        client.pre_call(&caller, &route);
+
+        let t0 = env.ledger().timestamp();
+
+        let mid_window = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(mid_window.calls_in_window, 3, "3 calls inside the 10 s override window");
+
+        // Advance 15 s — past the 10 s override window but well before the 60 s route window.
+        env.ledger().set_timestamp(t0 + 15);
+
+        let after_override_window = client.rate_limit_state(&route, &caller).unwrap();
+        assert_eq!(
+            after_override_window.calls_in_window, 0,
+            "override window elapsed: rate_limit_state must report 0, not stale counts"
+        );
+    }
+
+    /// get_route_rate_limit_stats must also use each caller's effective window.
+    /// A caller whose override window (10 s) has elapsed must contribute 0 calls
+    /// to the aggregate, even if the route's base window (60 s) has not elapsed.
+    #[test]
+    fn test_get_route_rate_limit_stats_uses_per_caller_effective_window() {
+        let (env, admin, client) = setup();
+        let route = String::from_str(&env, "oracle/get_price");
+        // Route: 60 s window, 10 calls max.
+        client.configure_route(&admin, &route, &10, &60, &true, &0, &0, &0, &0);
+        let caller_with_override = Address::generate(&env);
+        let caller_without_override = Address::generate(&env);
+        // Override for first caller: 10 s window.
+        client.configure_caller_rate_limit(&admin, &route, &caller_with_override, &5, &10);
+
+        let t0 = env.ledger().timestamp();
+
+        // Both callers make 2 calls inside their respective windows.
+        client.pre_call(&caller_with_override, &route);
+        client.pre_call(&caller_with_override, &route);
+        client.pre_call(&caller_without_override, &route);
+        client.pre_call(&caller_without_override, &route);
+
+        let stats_before = client.get_route_rate_limit_stats(&route).unwrap();
+        assert_eq!(stats_before.total_calls_in_window, 4);
+
+        // Advance 15 s — override window (10 s) has elapsed, route window (60 s) has not.
+        env.ledger().set_timestamp(t0 + 15);
+
+        let stats_after = client.get_route_rate_limit_stats(&route).unwrap();
+        // caller_with_override's window expired → 0 calls from them.
+        // caller_without_override's 60 s window still active → 2 calls still counted.
+        assert_eq!(
+            stats_after.total_calls_in_window, 2,
+            "only the caller whose window is still active should be counted"
         );
     }
 
